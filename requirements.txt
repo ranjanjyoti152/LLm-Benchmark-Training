@@ -1,0 +1,27 @@
+# Deep Learning and Model Training
+torch>=2.0.0
+torchvision
+torchaudio
+transformers>=4.30.0
+accelerate>=0.20.0
+datasets>=2.10.0
+bitsandbytes>=0.41.0  # For quantization support
+
+# System Monitoring
+psutil>=5.9.0
+nvidia-ml-py>=12.535.0
+GPUtil>=1.4.0
+
+# Data Processing and Export
+pandas>=2.0.0
+openpyxl>=3.1.0
+numpy>=1.24.0
+
+# Configuration and Utilities
+pyyaml>=6.0
+requests>=2.31.0
+
+# Progress bars and logging
+tqdm>=4.65.0
+colorlog>=6.7.0
+tokenizers>=0.13.0

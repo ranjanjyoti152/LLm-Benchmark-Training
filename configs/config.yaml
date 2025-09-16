@@ -1,0 +1,102 @@
+# Configuration file for LLM benchmarking tool
+
+# System settings
+system:
+  device: "auto"  # "auto", "cpu", "cuda", or specific GPU IDs
+  multi_gpu: true  # Enable multi-GPU training if available
+  mixed_precision: true  # Use mixed precision training
+  gradient_checkpointing: false  # Enable gradient checkpointing to save memory
+
+# Model configurations
+models:
+  sizes: ["1B", "3B", "7B", "11B", "13B", "15B", "20B", "30B", "65B", "120B"]  # Extended model sizes for comprehensive benchmarking
+  quantization:
+    enabled: true  # Enable quantization as fallback when models fail to load
+    methods: ["8bit", "4bit", "int8", "fp16"]  # Available quantization methods (applied as fallback)
+    fallback_strategy: true  # Try loading without quantization first, apply quantization only if loading fails
+    priority_order: ["none", "fp16", "8bit", "4bit"]  # Order of quantization attempts
+  custom_models:  # Optional: specify custom model configurations
+    # "custom_1B":
+    #   hidden_size: 1024
+    #   num_layers: 24
+    #   num_attention_heads: 16
+    #   vocab_size: 50257
+    #   max_position_embeddings: 1024
+  
+# Training parameters
+training:
+  epochs: 2  # Fixed to 2 epochs as per requirements
+  num_samples: 1000  # Number of training samples per model
+  batch_sizes:  # Optimized batch sizes per model with quantization consideration
+    "1B": 16      # Larger batch for small models
+    "3B": 12
+    "7B": 8       # Standard batch sizes
+    "11B": 6
+    "13B": 4
+    "15B": 3      # Smaller batches for large models
+    "20B": 2
+    "30B": 1
+    "65B": 1
+    "120B": 1
+  learning_rates:  # Optimized learning rates per model size
+    "1B": 5e-5
+    "3B": 4e-5
+    "7B": 3e-5
+    "11B": 2.5e-5
+    "13B": 2e-5
+    "15B": 1.8e-5
+    "20B": 1.5e-5
+    "30B": 1.2e-5
+    "65B": 1e-5
+    "120B": 8e-6
+  gradient_accumulation:  # Steps to accumulate gradients for effective larger batches
+    "1B": 1
+    "3B": 1  
+    "7B": 1
+    "11B": 2
+    "13B": 2
+    "15B": 4
+    "20B": 4
+    "30B": 8
+    "65B": 8
+    "120B": 16
+  optimizer:
+    type: "adamw"  # "adamw", "adam", "sgd"
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    type: "cosine"  # "cosine", "linear", "constant"
+    warmup_steps: 100
+
+# Dataset configuration
+dataset:
+  type: "synthetic"  # "synthetic", "files", "huggingface"
+  max_length: 512  # Maximum sequence length
+  text_files: []  # List of text files to use if type is "files"
+  huggingface_dataset: null  # HuggingFace dataset name if type is "huggingface"
+  
+# System monitoring
+monitoring:
+  interval: 1.0  # Monitoring interval in seconds
+  log_interval: 10  # Logging interval in training steps
+  
+# Performance settings
+performance:
+  skip_on_error: true  # Skip failed models and continue
+  memory_cleanup: true  # Clean up GPU memory between models
+  compile_model: false  # Use torch.compile for optimization (experimental)
+  
+# Output settings
+output:
+  directory: "./benchmark_results"
+  save_individual_results: true
+  save_raw_metrics: true
+  save_system_info: true
+  excel_charts: true
+  timestamp_folders: false  # Create timestamped subfolders
+
+# Logging configuration
+logging:
+  level: "INFO"  # "DEBUG", "INFO", "WARNING", "ERROR"
+  file: "benchmark.log"
+  console: true
