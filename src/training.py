@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import time
 import logging
+import math
 from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass
 import threading
@@ -114,6 +115,65 @@ class BenchmarkTrainer:
         except Exception as e:
             self.logger.warning(f"Could not determine model input device: {e}, using default: {self.device}")
             return self.device
+    
+    def _prepare_model_for_training(self):
+        """Prepare the model for stable training by checking and initializing parameters."""
+        logger.info("🔧 Preparing model for stable training...")
+        
+        # Check for any NaN/inf parameters before training
+        nan_params = []
+        inf_params = []
+        zero_params = []
+        
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                nan_params.append(name)
+            if torch.isinf(param).any():
+                inf_params.append(name)
+            if torch.all(param == 0):
+                zero_params.append(name)
+        
+        if nan_params:
+            logger.warning(f"⚠️  NaN parameters detected: {nan_params}")
+            # Reinitialize NaN parameters
+            for name, param in self.model.named_parameters():
+                if name in nan_params:
+                    if 'weight' in name:
+                        torch.nn.init.xavier_uniform_(param)
+                    else:
+                        torch.nn.init.zeros_(param)
+            logger.info("✅ NaN parameters reinitialized")
+        
+        if inf_params:
+            logger.warning(f"⚠️  Inf parameters detected: {inf_params}")
+            # Reinitialize Inf parameters
+            for name, param in self.model.named_parameters():
+                if name in inf_params:
+                    if 'weight' in name:
+                        torch.nn.init.xavier_uniform_(param)
+                    else:
+                        torch.nn.init.zeros_(param)
+            logger.info("✅ Inf parameters reinitialized")
+        
+        if zero_params:
+            logger.info(f"ℹ️  Zero-initialized parameters found: {len(zero_params)} (this may be normal)")
+        
+        # Enable gradient checkpointing for large models to save memory
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            try:
+                self.model.gradient_checkpointing_enable()
+                logger.info("✅ Enabled gradient checkpointing")
+            except Exception as e:
+                logger.warning(f"Could not enable gradient checkpointing: {e}")
+        
+        # Set model to training mode with dropout for regularization
+        self.model.train()
+        
+        # For distributed models, ensure all parameters are properly initialized
+        if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
+            logger.info("✅ Model uses device_map, parameters distributed across GPUs")
+        
+        logger.info("✅ Model preparation completed")
         
     def _get_optimal_batch_size(self) -> int:
         """
@@ -289,10 +349,18 @@ class BenchmarkTrainer:
             
             batch_size, sequence_length = input_ids.shape
             
-            # Forward pass
+            # Forward pass with error handling
             optimizer.zero_grad()
             
-            outputs = self.model(input_ids, labels=labels)
+            try:
+                outputs = self.model(input_ids, labels=labels)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logger.warning(f"OOM during forward pass at step {step}, clearing cache and continuing")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
             
             # Handle different output types (simple loss vs object with loss)
             if hasattr(outputs, 'loss'):
@@ -307,8 +375,50 @@ class BenchmarkTrainer:
             if loss.dim() > 0:
                 loss = loss.mean()
             
-            # Backward pass
-            loss.backward()
+            # Critical: Check for NaN/inf loss before backward pass
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                logger.warning(f"⚠️  NaN/Inf loss detected at step {step}: {loss.item()}")
+                logger.warning("Skipping backward pass and continuing with next batch")
+                continue
+            
+            # Check for reasonable loss values
+            loss_value = loss.item()
+            if loss_value > 100.0:  # Unreasonably high loss
+                logger.warning(f"⚠️  Very high loss detected at step {step}: {loss_value:.4f}")
+                logger.warning("Reducing learning rate temporarily")
+                # Temporarily reduce learning rate for this step
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.1
+            
+            # Backward pass with gradient scaling for stability
+            try:
+                # For very small losses, scale them up to prevent underflow
+                if loss_value < 1e-6:
+                    scaled_loss = loss * 1e6
+                    scale_factor = 1e6
+                    logger.debug(f"Scaling very small loss {loss_value:.2e} by {scale_factor}")
+                elif loss_value < 1e-3:
+                    scaled_loss = loss * 1e3
+                    scale_factor = 1e3
+                else:
+                    scaled_loss = loss
+                    scale_factor = 1.0
+                
+                scaled_loss.backward()
+                
+                # Scale gradients back down if we scaled the loss
+                if scale_factor > 1.0:
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad.data *= (1.0 / scale_factor)
+                        
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logger.warning(f"OOM during backward pass at step {step}, clearing cache and continuing")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
             
             # Synchronize gradients for distributed models
             if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
@@ -318,8 +428,31 @@ class BenchmarkTrainer:
                 except Exception as e:
                     self.logger.warning(f"Error synchronizing CUDA: {e}")
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Critical: Check gradients for NaN/inf before clipping
+            nan_grads = False
+            inf_grads = False
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        nan_grads = True
+                        logger.warning(f"NaN gradient detected in {name}")
+                    if torch.isinf(param.grad).any():
+                        inf_grads = True
+                        logger.warning(f"Inf gradient detected in {name}")
+            
+            if nan_grads or inf_grads:
+                logger.warning("⚠️  NaN/Inf gradients detected, skipping optimizer step")
+                optimizer.zero_grad()
+                continue
+            
+            # Aggressive gradient clipping for stability
+            max_grad_norm = 0.5  # More conservative than 1.0
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
+            
+            # Check if gradient norm is too high
+            if grad_norm > max_grad_norm * 2:
+                logger.warning(f"⚠️  High gradient norm detected: {grad_norm:.4f}, applying extra clipping")
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm * 0.5)
             
             optimizer.step()
             
@@ -438,6 +571,9 @@ class BenchmarkTrainer:
         """
         logger.info(f"Starting benchmark training for {self.model_size} model")
         
+        # Prepare model for stable training
+        self._prepare_model_for_training()
+        
         # Start monitoring
         self._start_monitoring()
         self.training_start_time = time.time()
@@ -461,26 +597,54 @@ class BenchmarkTrainer:
             
             # Setup optimizer - use memory efficient settings for large models
             param_count = sum(p.numel() for p in self.model.parameters())
+            param_count_b = param_count / 1e9
+            
+            logger.info(f"Model has {param_count_b:.1f}B parameters, configuring optimizer accordingly")
+            
             if param_count > 1e9:  # For models > 1B params
+                # Ultra-conservative settings for large models
+                base_lr = 5e-6  # Much lower base learning rate
+                if param_count_b > 10:  # For very large models (>10B)
+                    base_lr = 1e-6
+                elif param_count_b > 30:  # For extremely large models (>30B)
+                    base_lr = 5e-7
+                
                 optimizer = torch.optim.AdamW(
                     self.model.parameters(),
-                    lr=1e-5,  # Lower LR for large models
+                    lr=base_lr,
                     weight_decay=0.01,
                     eps=1e-8,
-                    betas=(0.9, 0.95)
+                    betas=(0.9, 0.999),  # More stable betas
+                    amsgrad=True  # Use AMSGrad variant for stability
                 )
+                logger.info(f"🔧 Using conservative AdamW for {param_count_b:.1f}B model with LR={base_lr:.1e}")
             else:
+                # Standard settings for smaller models
                 optimizer = torch.optim.AdamW(
                     self.model.parameters(),
-                    lr=2e-5,
-                    weight_decay=0.01
+                    lr=1e-5,  # Reduced from 2e-5
+                    weight_decay=0.01,
+                    eps=1e-8,
+                    betas=(0.9, 0.999)
                 )
+                logger.info(f"🔧 Using standard AdamW for {param_count_b:.1f}B model")
             
-            # Setup learning rate scheduler
+            # Setup learning rate scheduler with warmup
             total_steps = len(dataloader) * 2  # 2 epochs
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_steps
-            )
+            warmup_steps = min(100, total_steps // 10)  # 10% warmup or max 100 steps
+            
+            # Create a custom scheduler with warmup
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    # Linear warmup
+                    return step / warmup_steps
+                else:
+                    # Cosine annealing after warmup
+                    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                    return 0.5 * (1 + math.cos(progress * math.pi))
+            
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            logger.info(f"🔧 Configured scheduler with {warmup_steps} warmup steps out of {total_steps} total steps")
             
             # Train for exactly 2 epochs
             epoch_results = []
