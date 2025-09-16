@@ -227,7 +227,10 @@ class BenchmarkOrchestrator:
             # Clean up model to free memory
             del model, trainer
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as cache_error:
+                    logger.warning(f"Error during CUDA cache cleanup: {cache_error}")
             
             logger.info(f"Completed benchmark for {model_size} model")
             return results
@@ -242,13 +245,43 @@ class BenchmarkOrchestrator:
                 del model
             if 'trainer' in locals():
                 del trainer
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                logger.warning("Could not clear CUDA cache during OOM recovery")
             gc.collect()
             
             # Try with quantization as fallback
             logger.info(f"🔄 Retrying {model_size} with forced quantization...")
             return self._retry_with_quantization(model_size)
             
+        except (torch.AcceleratorError, RuntimeError) as e:
+            if "CUDA" in str(e) or "illegal memory access" in str(e):
+                logger.error(f"CUDA error during {model_size} benchmark: {e}")
+                
+                # Clean up and try to recover
+                if hasattr(self, '_current_model'):
+                    del self._current_model
+                if 'model' in locals():
+                    del model
+                if 'trainer' in locals():
+                    del trainer
+                
+                # Reset CUDA context
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except Exception:
+                    logger.warning("Could not reset CUDA context")
+                
+                gc.collect()
+                logger.error(f"✗ Critical error benchmarking {model_size}: {e}")
+                logger.info("Continuing with next model...")
+                return None
+            else:
+                # Re-raise non-CUDA errors
+                raise e
+                
         except Exception as e:
             logger.error(f"Error benchmarking {model_size} model: {e}")
             logger.error(traceback.format_exc())

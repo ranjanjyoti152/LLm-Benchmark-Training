@@ -73,6 +73,9 @@ class BenchmarkTrainer:
         self.monitoring_interval = monitoring_interval
         self.log_interval = log_interval
         
+        # Initialize logging
+        self.logger = logging.getLogger(__name__)
+        
         # Initialize monitoring
         self.monitor = SystemMonitor()
         self.metrics_history: List[TrainingMetrics] = []
@@ -89,6 +92,28 @@ class BenchmarkTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         os.makedirs(output_dir, exist_ok=True)
+    
+    def _get_model_input_device(self):
+        """Get the device where model expects input tensors."""
+        try:
+            # For multi-GPU models with device_map
+            if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
+                # Find the device of the first layer (embedding layer)
+                for name, device in self.model.hf_device_map.items():
+                    if 'embed' in name.lower() or 'wte' in name.lower():
+                        self.logger.info(f"🎯 Found input device from device_map: {device} (layer: {name})")
+                        return torch.device(f"cuda:{device}" if isinstance(device, int) else device)
+                
+                # Fallback: use the device of the first parameter
+                first_param_device = next(self.model.parameters()).device
+                self.logger.info(f"🎯 Using first parameter device: {first_param_device}")
+                return first_param_device
+            else:
+                # Standard single device or DataParallel
+                return self.device
+        except Exception as e:
+            self.logger.warning(f"Could not determine model input device: {e}, using default: {self.device}")
+            return self.device
         
     def _get_optimal_batch_size(self) -> int:
         """
@@ -133,7 +158,7 @@ class BenchmarkTrainer:
         else:  # > 20B parameters
             batch_size = 1
         
-        logger.info(f"Model: {param_count_b:.1f}B params, GPU memory: {gpu_memory_gb:.1f}GB, "
+        self.logger.info(f"Model: {param_count_b:.1f}B params, GPU memory: {gpu_memory_gb:.1f}GB, "
                    f"Available: {usable_memory:.1f}GB, Batch size: {batch_size}")
         
         return batch_size
@@ -257,9 +282,10 @@ class BenchmarkTrainer:
             self.current_step = step
             step_start_time = time.time()
             
-            # Move batch to device
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            # Move tensors to the correct device for the model
+            model_input_device = self._get_model_input_device()
+            input_ids = batch["input_ids"].to(model_input_device)
+            labels = batch["labels"].to(model_input_device)
             
             batch_size, sequence_length = input_ids.shape
             
@@ -284,6 +310,14 @@ class BenchmarkTrainer:
             # Backward pass
             loss.backward()
             
+            # Synchronize gradients for distributed models
+            if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
+                try:
+                    # Ensure all gradient computations are complete
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    self.logger.warning(f"Error synchronizing CUDA: {e}")
+            
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
@@ -299,20 +333,28 @@ class BenchmarkTrainer:
             if torch.cuda.is_available():
                 # Check GPU memory usage after every few steps
                 if step % 5 == 0:  # Check every 5 steps
-                    for gpu_id in range(torch.cuda.device_count()):
-                        memory_allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)  # GB
-                        memory_reserved = torch.cuda.memory_reserved(gpu_id) / (1024**3)   # GB
-                        memory_total = torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)  # GB
-                        
-                        # If memory usage is very high, clean up
-                        if memory_allocated > memory_total * 0.9:  # If >90% usage
-                            logger.warning(f"High memory usage on GPU {gpu_id}: {memory_allocated:.1f}GB/{memory_total:.1f}GB")
-                            torch.cuda.empty_cache()
-                            break
+                    try:
+                        for gpu_id in range(torch.cuda.device_count()):
+                            memory_allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)  # GB
+                            memory_reserved = torch.cuda.memory_reserved(gpu_id) / (1024**3)   # GB
+                            memory_total = torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)  # GB
+                            
+                            # If memory usage is very high, clean up carefully
+                            if memory_allocated > memory_total * 0.9:  # If >90% usage
+                                self.logger.warning(f"High memory usage on GPU {gpu_id}: {memory_allocated:.1f}GB/{memory_total:.1f}GB")
+                                # Only clear cache on this specific GPU if possible
+                                with torch.cuda.device(gpu_id):
+                                    torch.cuda.empty_cache()
+                                break
+                    except Exception as e:
+                        self.logger.warning(f"Error checking GPU memory: {e}")
                 
-                # Emergency memory cleanup if we're getting close to OOM
-                if step % 10 == 0:  # Every 10 steps
-                    torch.cuda.empty_cache()
+                # Less frequent and safer memory cleanup for distributed models
+                if step % 20 == 0 and not hasattr(self.model, 'hf_device_map'):  # Only for non-distributed models
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception as e:
+                        self.logger.warning(f"Error during memory cleanup: {e}")
             
             # Calculate timing and tokens
             step_time = time.time() - step_start_time

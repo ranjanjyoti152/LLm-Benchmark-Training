@@ -1,19 +1,9 @@
 """
-Model configuration and loading utilities         "20B": {
-            "model_name": "gpt2",  # We'll scale this up
-            "hidden_size": 3072,  # Reduced from 4096
-            "num_layers": 24,     # Reduced from 36
-            "num_attention_heads": 24,
-            "vocab_size": 50257,
-            "max_position_embeddings": 2048,
-            "batch_size": 1,      # Reduced for memory
-            "gradient_accumulation_steps": 16,
-            "learning_rate": 1e-5,
-            "block_size": 1024
-        },hmarking.
+Model configuration and loading utilities for LLM benchmarking.
 Supports loading different model sizes with multi-GPU configurations.
 """
 
+import os
 import torch
 import torch.nn as nn
 from transformers import (
@@ -23,6 +13,10 @@ from transformers import (
 )
 from typing import Dict, Any, Tuple, Optional
 import logging
+import gc
+
+# Set environment variable for better memory management
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Try to import bitsandbytes for quantization
 try:
@@ -287,8 +281,34 @@ class ModelLoader:
         
         if not torch.cuda.is_available():
             logger.warning("CUDA not available. Running on CPU will be very slow.")
+        else:
+            # Clear any existing cache and set up memory management
+            self.cleanup_memory()
+            
+            # Log GPU information
+            for i in range(self.device_count):
+                props = torch.cuda.get_device_properties(i)
+                memory_gb = props.total_memory / (1024**3)
+                logger.info(f"GPU {i}: {props.name} ({memory_gb:.1f} GB)")
         
         logger.info(f"Using {self.device_count} GPU(s)")
+
+    def cleanup_memory(self):
+        """Clean up GPU memory and reduce fragmentation."""
+        if torch.cuda.is_available():
+            # Clear cache on all devices
+            torch.cuda.empty_cache()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Synchronize all devices
+            for i in range(self.device_count):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            
+            logger.debug("🧹 Memory cleanup completed")
 
     def create_custom_model(self, config: Dict[str, Any]) -> nn.Module:
         """
@@ -414,6 +434,9 @@ class ModelLoader:
         Returns:
             Tuple of (model, tokenizer)
         """
+        # Clean up memory before attempting to load
+        self.cleanup_memory()
+        
         config = ModelConfig.get_config(model_size, self.device_count)
         
         logger.info(f"Loading {model_size} model...")
@@ -443,6 +466,9 @@ class ModelLoader:
         except Exception as e:
             logger.warning(f"❌ Failed to load model without quantization: {e}")
             
+            # Clean up memory before trying quantization
+            self.cleanup_memory()
+            
             # Attempt 2: Try with FP16 if not already tried
             if quantization_used is None:
                 logger.info("🔄 Attempting to load model with FP16...")
@@ -453,6 +479,7 @@ class ModelLoader:
                     
                 except Exception as e:
                     logger.warning(f"❌ Failed to load model with FP16: {e}")
+                    self.cleanup_memory()
             
             # Attempt 3: Try with 8-bit quantization for medium models
             if quantization_used is None and model_size in ["7B", "11B", "13B"]:
@@ -464,6 +491,7 @@ class ModelLoader:
                     
                 except Exception as e:
                     logger.warning(f"❌ Failed to load model with 8-bit quantization: {e}")
+                    self.cleanup_memory()
             
             # Attempt 4: Try with 4-bit quantization for large models
             if quantization_used is None and model_size in ["15B", "20B", "30B", "65B", "120B"]:
@@ -475,10 +503,12 @@ class ModelLoader:
                     
                 except Exception as e:
                     logger.warning(f"❌ Failed to load model with 4-bit quantization: {e}")
+                    self.cleanup_memory()
             
             # Final fallback: Create custom model
             if model is None:
                 logger.info("🔧 All quantization attempts failed, creating custom model...")
+                self.cleanup_memory()
                 model = self._create_custom_model_fallback(config, model_size)
                 quantization_used = "custom"
         
@@ -490,7 +520,46 @@ class ModelLoader:
 
     def _try_load_model_standard(self, config: Dict, model_size: str) -> nn.Module:
         """Try to load model using standard approach without quantization."""
-        # Create custom model with exact specifications
+        # Calculate total available GPU memory
+        total_gpu_memory_gb = 0
+        per_gpu_memory_gb = {}
+        if torch.cuda.is_available():
+            for i in range(self.device_count):
+                gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                per_gpu_memory_gb[i] = gpu_memory * 0.85  # Use 85% to leave room for training
+                total_gpu_memory_gb += per_gpu_memory_gb[i]
+        
+        logger.info(f"🔍 Available GPU memory: {total_gpu_memory_gb:.1f} GB total across {self.device_count} GPUs")
+        logger.info(f"🔍 Per GPU memory: {list(per_gpu_memory_gb.values())} GB")
+        
+        # For large models, try to use transformers with device_map first
+        if model_size in ["11B", "13B", "15B", "20B", "30B", "65B", "120B"] and self.device_count > 1:
+            try:
+                # Try loading with transformers and auto device mapping
+                device_map = "auto"
+                max_memory = {i: f"{int(mem)}GB" for i, mem in per_gpu_memory_gb.items()}
+                logger.info(f"🔄 Trying transformers with device_map='auto' and max_memory: {max_memory}")
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    config["model_name"],
+                    torch_dtype=torch.float16,  # Use FP16 for memory efficiency
+                    device_map=device_map,
+                    max_memory=max_memory,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True
+                )
+                
+                if hasattr(model, 'resize_token_embeddings'):
+                    model.resize_token_embeddings(config["vocab_size"])
+                
+                logger.info(f"✅ Successfully loaded {model_size} model with transformers device_map='auto'")
+                return model
+                
+            except Exception as e:
+                logger.warning(f"❌ Transformers device_map loading failed: {e}")
+                # Fall through to custom model creation
+        
+        # Create custom model
         model = self.create_custom_model(config)
         
         # Log model parameters
@@ -498,6 +567,31 @@ class ModelLoader:
         logger.info(f"Created {model_size} model with {num_params:,} parameters")
         
         # Move to GPU and setup for multi-GPU if available
+        if torch.cuda.is_available():
+            # Calculate model size in GB (FP32)
+            model_size_gb = num_params * 4 / (1024**3)  # 4 bytes per float32 parameter
+            
+            logger.info(f"Model size: {model_size_gb:.1f} GB (FP32)")
+            logger.info(f"Total available GPU memory: {total_gpu_memory_gb:.1f} GB")
+            
+            # Check if model fits in total available memory
+            if model_size_gb > total_gpu_memory_gb:
+                raise RuntimeError(f"Model too large for available GPUs ({model_size_gb:.1f} GB > {total_gpu_memory_gb:.1f} GB)")
+            
+            # If model fits in total memory but not single GPU, use model parallelism
+            if model_size_gb > max(per_gpu_memory_gb.values()):
+                logger.info(f"🔄 Model too large for single GPU, implementing model parallelism across {self.device_count} GPUs")
+                model = self._setup_model_parallel(model, model_size_gb)
+            else:
+                # Model fits on single GPU, but use DataParallel for training efficiency
+                model = model.to(self.device)
+                if self.device_count > 1:
+                    logger.info(f"🔄 Using DataParallel across {self.device_count} GPUs for data parallelism")
+                    model = nn.DataParallel(model)
+        else:
+            model = model.to(self.device)
+        
+        return model
         if torch.cuda.is_available():
             # Calculate model size in GB (FP32)
             model_size_gb = num_params * 4 / (1024**3)  # 4 bytes per float32 parameter
@@ -536,22 +630,50 @@ class ModelLoader:
         quantization_config = ModelConfig.get_quantization_config(quantization_type)
         memory_config = ModelConfig.get_memory_efficient_config(model_size)
         
+        # Calculate available memory across all GPUs
+        total_gpu_memory_gb = 0
+        per_gpu_memory_gb = {}
+        if torch.cuda.is_available():
+            for i in range(self.device_count):
+                gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                per_gpu_memory_gb[i] = gpu_memory * 0.85  # Use 85% to leave room for training
+                total_gpu_memory_gb += per_gpu_memory_gb[i]
+        
+        logger.info(f"🔍 Available GPU memory: {total_gpu_memory_gb:.1f} GB total across {self.device_count} GPUs")
+        logger.info(f"🔍 Per GPU memory: {list(per_gpu_memory_gb.values())} GB")
+        
         # For models that support quantization via transformers
         if quantization_config and HAS_BITSANDBYTES:
             try:
+                # Create device map for multi-GPU distribution
+                device_map = None
+                max_memory = None
+                
+                # For large models or when we have multiple GPUs, use device_map="auto"
+                if model_size in ["11B", "13B", "15B", "20B", "30B", "65B", "120B"] or self.device_count > 1:
+                    device_map = "auto"
+                    # Set max memory per GPU (leave room for training)
+                    max_memory = {i: f"{int(mem)}GB" for i, mem in per_gpu_memory_gb.items()}
+                    logger.info(f"🚀 Using device_map='auto' with max_memory: {max_memory}")
+                
                 # Try to load with quantization using transformers
                 model = AutoModelForCausalLM.from_pretrained(
                     config["model_name"],
                     quantization_config=quantization_config,
                     torch_dtype=memory_config.get("torch_dtype", torch.float16),
-                    device_map=memory_config.get("device_map", "auto") if model_size in ["65B", "120B"] else None,
-                    trust_remote_code=True
+                    device_map=device_map,
+                    max_memory=max_memory,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    load_in_8bit=(quantization_type in ["8bit", "int8"]) if HAS_BITSANDBYTES else False,
+                    load_in_4bit=(quantization_type == "4bit") if HAS_BITSANDBYTES else False
                 )
                 
                 # Resize model if needed to match target parameters
                 if hasattr(model, 'resize_token_embeddings'):
                     model.resize_token_embeddings(config["vocab_size"])
-                    
+                
+                logger.info(f"✅ Successfully loaded {model_size} model with {quantization_type} quantization across GPUs")
                 return model
                 
             except Exception as e:
@@ -578,20 +700,23 @@ class ModelLoader:
                 bytes_per_param = 1
                 
             model_size_gb = num_params * bytes_per_param / (1024**3)
-            gpu_memory_gb = 32  # Assuming 32GB per GPU
             
             logger.info(f"Model size: {model_size_gb:.1f} GB (with {quantization_type})")
+            logger.info(f"Total available GPU memory: {total_gpu_memory_gb:.1f} GB")
             
-            if model_size_gb > gpu_memory_gb * 0.8:  # If model needs more than 80% of single GPU
-                if model_size in ["65B", "120B"]:
-                    logger.info(f"Model too large for single GPU, implementing model parallelism")
-                    model = self._setup_model_parallel(model, model_size_gb)
-                else:
-                    raise RuntimeError(f"Model too large even with quantization ({model_size_gb:.1f} GB > {gpu_memory_gb*0.8:.1f} GB)")
+            # Check if model fits in total available memory
+            if model_size_gb > total_gpu_memory_gb:
+                raise RuntimeError(f"Model too large even with quantization ({model_size_gb:.1f} GB > {total_gpu_memory_gb:.1f} GB total)")
+            
+            # If model fits in total memory but not single GPU, use model parallelism
+            if model_size_gb > max(per_gpu_memory_gb.values()):
+                logger.info(f"🔄 Model too large for single GPU, implementing model parallelism across {self.device_count} GPUs")
+                model = self._setup_model_parallel(model, model_size_gb)
             else:
+                # Model fits on single GPU, but use DataParallel for training efficiency
                 model = model.to(self.device)
                 if self.device_count > 1:
-                    logger.info(f"Using DataParallel across {self.device_count} GPUs for data parallelism")
+                    logger.info(f"🔄 Using DataParallel across {self.device_count} GPUs for data parallelism")
                     model = nn.DataParallel(model)
         else:
             model = model.to(self.device)
